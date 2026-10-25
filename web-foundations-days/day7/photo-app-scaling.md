@@ -137,85 +137,61 @@ An object key might look like `photos/user_42/photo_1001/original.jpg`. It ident
 
 The application must still coordinate the two systems. Failed uploads, deleted database records, or orphaned objects should be handled using retries, cleanup jobs, and reconciliation.
 
-## 5. Request Flows
+## 5. Step-by-Step Photo Upload Flow
 
-### Uploading a Photo
+SnapShare separates photo storage from image processing so that users can upload photos without waiting for every thumbnail to finish generating.
 
-1. The client sends an authenticated upload request.
-2. The application validates the file type, size, and user's permissions.
-3. The original image is uploaded to object storage, preferably through a controlled upload URL when appropriate.
-4. The database records the photo metadata and object key.
-5. A processing job is added to the message queue.
-6. The API returns the upload status.
-7. A worker generates thumbnails and resized variants, stores them in object storage, and updates processing status.
-8. The CDN delivers eligible image variants to viewers.
+1. **Client initiates upload:** The user selects a photo. The client sends an authenticated request to the application server to initiate the upload.
+2. **Authentication and validation:** The application verifies the user's identity, checks upload permissions, and validates the file size and allowed image formats.
+3. **Upload to object storage:** The application issues a short-lived, authorized upload URL. The client uploads the original image directly to object storage, reducing bandwidth and processing pressure on the application servers.
+4. **Create the database record:** After the upload succeeds, the application creates a photo record in the relational database containing the photo ID, user ID, object key, dimensions, file size, and processing status.
+5. **Enqueue a background job:** The application publishes a thumbnail-generation job to the message queue. The job contains the photo ID and object key, not the entire image binary.
+6. **Process the image:** A background worker consumes the job, retrieves the original image from object storage, generates the required thumbnail and resized variants, and saves them back to object storage.
+7. **Update processing status:** The worker updates the database record to indicate that processing has completed and records the object keys for the generated variants. If processing fails, the job can be retried safely, with repeated attempts prevented from creating duplicate results.
+8. **Deliver the photo:** The application returns photo metadata and authorized image URLs to the client. The CDN can serve eligible resized images to viewers, reducing repeated requests to the origin storage.
 
-The implementation should handle partial failures. For example, if the object upload succeeds but the database write fails, a cleanup process should detect and remove orphaned objects.
+### Failure Handling
 
-### Viewing the Feed
+The database and object store do not normally share a single atomic transaction. If an upload succeeds but creating the database record fails, the system should retry or clean up the orphaned object. If publishing a queue job fails after the database write, a transactional outbox or retry mechanism can ensure the job is eventually published. Failed jobs should be retried with limits and moved to a dead-letter queue for investigation when necessary.
 
-1. The client requests its feed.
-2. The load balancer forwards the request to an application server.
-3. The application authenticates the user and checks Redis for cached feed data.
-4. On a cache miss, the application retrieves the relevant metadata from the database or an appropriate read replica.
-5. The application returns feed metadata and authorized image URLs.
-6. The CDN serves cached image variants where possible.
+The photo record should distinguish between states such as `uploading`, `processing`, `completed`, and `failed`, so clients can understand the current status.
 
-Private photos must use suitable authorization and caching rules to prevent unauthorized access.
+## 6. Architectural Trade-Offs
 
-## 6. Handling Traffic Spikes
+### Trade-Off 1: Synchronous vs. Asynchronous Thumbnail Generation
 
-A fivefold peak multiplier gives approximately 116 uploads per second and 1,157 feed views per second under the assumptions above.
+**Synchronous processing** generates thumbnails during the original upload request. Its advantage is that the resized images are ready before the request completes. However, image processing increases response time and consumes application resources. During peak upload traffic, this can exhaust application workers and reduce the number of requests the system can handle.
 
-To handle these peaks:
+**Asynchronous processing** stores the original image first and sends a job to a message queue. Background workers generate thumbnails independently. This keeps uploads responsive and allows worker capacity to scale separately. The disadvantage is that thumbnails may not be available immediately, and the queue requires monitoring and retry handling.
 
-- Scale application server instances horizontally behind the load balancer.
-- Use direct-to-object-storage uploads where appropriate to avoid routing large file bodies through application servers.
-- Place resizing jobs on a queue instead of processing every image synchronously.
-- Scale workers according to queue depth and processing latency.
-- Use Redis and the CDN to reduce repeated database queries and image transfers.
-- Apply upload size limits, rate limiting, timeouts, and backpressure to protect the system.
-- Monitor load balancer connections, application worker saturation, database connections, cache hit rate, queue age, and storage errors.
+**Decision:** SnapShare uses asynchronous thumbnail generation because it separates expensive image processing from the user-facing upload request and handles bursts more effectively.
 
-The queue absorbs temporary bursts, but it does not create unlimited capacity. If incoming jobs permanently exceed worker throughput, the backlog will continue to grow.
+### Trade-Off 2: Primary Database vs. Read Replicas
 
-## 7. Reliability and Security
+The primary database handles writes and provides the authoritative record of each photo. Read replicas can serve feed and metadata queries, reducing read pressure on the primary database.
 
-- Run multiple application server instances across failure domains where supported.
-- Use database backups, replication, and a tested restoration and failover plan.
-- Configure object storage durability, appropriate access policies, and recovery controls.
-- Authenticate users and enforce photo ownership checks.
-- Validate file formats and sizes; do not trust client-supplied content types alone.
-- Use HTTPS and short-lived authorized upload or download URLs where appropriate.
-- Retry transient failures safely and make background jobs idempotent to prevent duplicate processing.
-- Monitor error rates, latency, queue backlog, database load, and storage failures.
+However, replication is often asynchronous. A newly uploaded photo may exist in the primary database before it appears on a replica. A user who immediately refreshes their feed could temporarily fail to see the photo.
 
-A read replica helps scale reads but is not a substitute for a backup.
+**Decision:** Use the primary database for writes and read replicas for suitable high-volume reads. For read-after-write operations, read from the primary database or use a consistency strategy that ensures the new record is visible before relying on a replica.
 
-## 8. Architectural Trade-Offs
+### Trade-Off 3: Caching vs. Freshness
 
-### Object Storage vs. Database BLOBs
+Redis and the CDN reduce repeated database queries and image transfers. This improves latency and reduces infrastructure load. However, cached feeds or image metadata may become stale after a photo is uploaded, updated, or deleted.
 
-Object storage handles large image files efficiently and keeps the relational database focused on structured data. However, it introduces coordination between the database and object store, so the application needs cleanup and recovery procedures for partial failures.
+**Decision:** Invalidate affected feed-cache entries after writes, use appropriate expiration policies, and use versioned image URLs for updated image variants. Private images must have suitable authorization and caching rules.
 
-### Synchronous vs. Asynchronous Image Processing
+### Trade-Off 4: Object Storage vs. Database BLOBs
 
-Synchronous resizing can return a completed image immediately, but it increases request latency and consumes application resources. Asynchronous workers keep uploads responsive and absorb bursts, but resized variants may not be ready immediately.
+Storing image binaries in object storage keeps the relational database focused on compact, searchable metadata. This reduces pressure on database memory, query performance, and database backups.
 
-### Caching vs. Data Freshness
+The trade-off is that metadata and image files live in separate systems. Partial failures can create missing references or orphaned files.
 
-Redis and the CDN reduce repeated work and improve response times. However, cached feeds or images can become stale. Cache invalidation, versioned image URLs, and appropriate expiration policies help manage freshness.
+**Decision:** Store image binaries in object storage and references in the relational database. Use retries, reconciliation jobs, and cleanup policies to handle partial failures.
 
-### Read Replicas vs. Consistency
+## 7. Conclusion
 
-Read replicas increase read capacity but may lag behind the primary database. Operations that must immediately reflect a newly uploaded photo should use a suitable consistency strategy rather than assuming every replica is instantly up to date.
+SnapShare uses stateless application servers behind a load balancer, a CDN for image delivery, Redis for frequently accessed data, a relational database for metadata, object storage for image binaries, and a queue with background workers for thumbnail generation.
 
-### Durability vs. Cost
+The capacity estimates indicate approximately 116 peak uploads per second under the stated assumptions. The architecture addresses that load by separating upload handling from image processing and scaling application servers and workers independently.
 
-Replicas, backups, and multiple image variants improve resilience and user experience but increase storage costs. Lifecycle policies, retention rules, and appropriate image formats can reduce costs without sacrificing required recovery guarantees.
-
-## 9. Conclusion
-
-SnapShare's design separates request handling, metadata storage, and image processing. The CDN and Redis reduce repeated read work, the load balancer distributes requests across stateless servers, object storage holds image binaries, and background workers process resizing jobs asynchronously.
-
-The capacity estimates show that peak upload traffic and feed-read traffic impose different demands on the system. Scaling decisions should be validated through monitoring and load testing, with particular attention to upload concurrency, database connection capacity, queue throughput, and annual storage growth.
+The design balances responsiveness, consistency, reliability, and cost. Its effectiveness should be validated through load testing and monitoring of upload latency, application-server saturation, queue backlog, database performance, and storage growth.
